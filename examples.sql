@@ -174,4 +174,388 @@ PROCEDURE pr_envia_interfaz_sap (
             raise_application_error(-20999, 'Error general en IZT_INTERFACE_IFI11_VOUCHER.pr_envia_interfaz_sap: ' || SQLERRM);
     END pr_envia_interfaz_sap;
     
-    
+    --ejemplo implementación inbound mediante ps_setDataForPublishIfi
+     PROCEDURE p_ifi006_registro (
+        json_entrada   IN             CLOB,
+        p_outputdata   OUT            CLOB
+    ) AS
+        id_banner           varchar2(64);
+        doc_number          varchar2(64);
+        ncre_sri            varchar2(64);
+        valor               varchar2(64);
+        fecha_transac       varchar2(64);
+        v_error             varchar2(1) := 'N';
+        detail_desc         varchar2(64);
+        cod_detalle         varchar2(32);
+        ---------------------------------------
+        pidm                number;
+        ---------------------------------------
+        lv_out_stat            varchar2(4000);
+		lv_anul_validate	   varchar2(1);
+		lv_cancel_validate	   varchar2(1);
+		lv_acdt_validate	   varchar2(1);
+		lv_sum_tbraccd		   tbraccd.tbraccd_amount%type;
+		lv_sum_value_tram	   tbraccd.tbraccd_amount%type;
+		lv_sum_charge		   tbraccd.tbraccd_amount%type;
+		lv_sum_pay			   tbraccd.tbraccd_amount%type;
+        lv_sum_nc              tbraccd.tbraccd_amount%type;
+		---------------------------------------
+        cursor searchCursor is
+            select i.*
+            from tzrfact i
+            where 1=1
+                --and i.tzrfact_id = id_banner
+                and i.tzrfact_sri_docnum = doc_number
+                and i.tzrfact_crednt_sricode = ncre_sri
+            fetch first 1 rows only;
+        ---------------------------------------
+        cursor tranCursor is
+            select tbraccd_tran_number from tbraccd, spriden
+            where 1=1
+                and spriden_id = id_banner
+                and spriden_pidm = tbraccd_pidm
+            order by tbraccd_tran_number desc
+            fetch first 1 rows only;
+        ---------------------------------------
+		--acastillo ajuste control devolucion
+		cursor c_anul_validate is
+		select unique 'Y'
+		from tzrfact
+		where tzrfact_crednt_sricode = ncre_sri
+		and   tzrfact_sdoc_code = 'BA';
+		--and   tzrfact_pidm = pidm;
+
+		cursor c_cancel_validate is
+		select unique 'Y'
+		from tzrfact
+		where tzrfact_crednt_sricode = ncre_sri
+		--and   tzrfact_pidm = pidm
+		and   tzrfact_nc_cancel_ind ='Y';
+
+		cursor c_acdt_validate is
+		select unique 'Y'
+		from  tbracdt
+		where tbracdt_text = ncre_sri
+		and   tbracdt_pidm = pidm;
+
+		cursor c_sum_tbraccd is
+		select sum (tbraccd_amount)
+		from tbraccd
+		where tbraccd_tran_number in (select tbracdt_tran_number
+										from tbracdt
+										where tbracdt_text = ncre_sri
+										and tbracdt_pidm = pidm
+										)
+		and tbraccd_pidm = pidm;
+
+		cursor c_sum_charge is
+		select sum(tzrfact_amnt_trans)
+		from tzrfact, tbbdetc
+		where tzrfact_det_code_doc = tbbdetc_detail_code
+		and   tzrfact_crednt_sricode = ncre_sri--'001-125-000020031'
+		and   tzrfact_sdoc_code='BN'
+		and   tbbdetc_type_ind='C';
+
+		cursor c_sum_pay is
+		select sum(tzrfact_amnt_trans)
+		from tzrfact, tbbdetc
+		where tzrfact_det_code_doc = tbbdetc_detail_code
+		and   tzrfact_crednt_sricode = ncre_sri--'001-125-000020031'
+		and   tzrfact_sdoc_code='BN'
+		and   tbbdetc_type_ind='P';
+		---------------------------------------
+
+        globalObj                  json;
+        rootObj                    json;
+        tzRecord                   tzrfact%rowtype;
+        lastTranNumber             number(9);
+        p_row_id                   rowid;
+        --Salida
+        mensaje_error              clob := ' ';
+        response_obj               json;
+        largeresponse              clob := ' ';
+	    v_recid                     number;
+
+    BEGIN
+        -------------------------------------------------------------------
+        globalObj := json(json_entrada);
+        rootObj := json(globalObj.get('devolucion'));
+        -------------------------------------------------------------------
+        response_obj := json();
+        mensaje_error := '';
+		ncre_sri := null;
+		lv_anul_validate := null;
+		lv_cancel_validate := null;
+		lv_acdt_validate := null;
+		lv_sum_tbraccd   := 0;
+		lv_sum_value_tram := 0;
+		lv_sum_charge :=0;
+		lv_sum_pay :=0;
+
+        -------------------------------------------------------------------
+        id_banner := izt_interface_util.validate_field(rootObj, 'id_banner');
+        if id_banner = '' or id_banner is null then
+            mensaje_error := mensaje_error || 'El campo "id_banner" es obligatorio ';
+            v_error := 'Y';
+        end if;
+
+        doc_number := izt_interface_util.validate_field(rootObj, 'num_documento');
+        if doc_number = '' or doc_number is null then
+            mensaje_error := mensaje_error || 'El campo "num_documento" es obligatorio ';
+            v_error := 'Y';
+        end if;
+
+        ncre_sri := izt_interface_util.validate_field(rootObj, 'ncred_sri');
+        if ncre_sri = '' or ncre_sri is null then
+            mensaje_error := mensaje_error || 'El campo "ncre_sri" es obligatorio ';
+            v_error := 'Y';
+			else
+				open c_anul_validate;
+				fetch c_anul_validate into lv_anul_validate;
+				close c_anul_validate;
+
+				open c_cancel_validate;
+				fetch c_cancel_validate into lv_cancel_validate;
+				close c_cancel_validate;
+
+				if lv_anul_validate = 'Y' then
+					v_error := 'Y';
+					mensaje_error := mensaje_error || 'Se emitió una nota de crédito Total ';
+
+				end if;
+                if  lv_cancel_validate = 'Y' THEN
+						mensaje_error := mensaje_error || 'La nota crédito fue anulada, no aplica devolución ';
+						v_error := 'Y';
+				end if;
+        end if;
+
+        valor := izt_interface_util.validate_field(rootObj, 'valor');
+        if valor = '' or valor is null then
+            mensaje_error := mensaje_error || 'El campo "valor" es obligatorio ';
+            v_error := 'Y';
+        elsif izt_interface_util.is_number(valor) <> 1 then
+            mensaje_error := mensaje_error || 'El campo "valor" debe ser numerico ';
+            v_error := 'Y';
+        end if;
+
+        fecha_transac := izt_interface_util.validate_field(rootObj, 'fecha_transac');
+        if fecha_transac = '' or fecha_transac is null then
+            mensaje_error := mensaje_error || 'El campo "fecha_transac" es obligatorio ';
+            v_error := 'Y';
+        elsif izt_interface_util.is_date(fecha_transac, 'DD/MM/YYYY') <> 1 then
+            mensaje_error := mensaje_error || 'El campo "fecha_transacc" debe ser una fecha valida en formato "DD/MM/YYYY" ';
+            v_error := 'Y';
+
+        end if;
+		-----------acastillo ajuste valida nota credito-----------------------
+		select distinct tzrfact_pidm into pidm from tzrfact where tzrfact_sri_docnum = doc_number and tzrfact_crednt_sricode = ncre_sri;
+		if sql%notfound then
+			response_obj.put('TIPO_MENSAJE', 'E');
+			response_obj.put('MENSAJE', 'No existe registro de persona con id "' || id_banner || '"');
+			v_error := 'Y';
+		end if;
+	if v_error = 'N' then
+		open c_acdt_validate;
+		fetch c_acdt_validate into lv_acdt_validate;
+		close c_acdt_validate;
+
+        open c_sum_tbraccd;
+        fetch c_sum_tbraccd into lv_sum_tbraccd;
+		if lv_sum_tbraccd is null then
+			lv_sum_tbraccd := 0;
+		end if;
+        close c_sum_tbraccd;
+        dbms_output.put_line('lv_sum_tbraccd '||lv_sum_tbraccd);
+
+        open c_sum_charge;
+        fetch c_sum_charge into lv_sum_charge;
+		if lv_sum_charge is null then
+			lv_sum_charge := 0;
+		end if;
+        close c_sum_charge;
+        dbms_output.put_line('lv_sum_charge '||lv_sum_charge);
+
+        open c_sum_pay;
+        fetch c_sum_pay into lv_sum_pay;
+		if lv_sum_pay is null then
+			lv_sum_pay := 0;
+		end if;
+		close c_sum_pay;
+
+		dbms_output.put_line('lv_sum_pay '||lv_sum_pay);
+        dbms_output.put_line('lv_acdt_validate '||lv_acdt_validate);
+
+		if lv_acdt_validate = 'Y' then
+
+			lv_sum_value_tram := lv_sum_tbraccd + valor;
+            dbms_output.put_line('lv_sum_value_tram = lv_sum_tbraccd + valor '||lv_sum_value_tram);
+            dbms_output.put_line('valor '||valor);
+
+			lv_sum_nc := lv_sum_charge - lv_sum_pay;
+            dbms_output.put_line('lv_sum_nc '||lv_sum_nc);
+			if lv_sum_nc < 0 then
+				if lv_sum_nc * -1 < lv_sum_value_tram then
+					mensaje_error := mensaje_error || 'No se puede grabar, supera el valor de la nota crédito';
+					v_error := 'Y';
+				dbms_output.put_line('mensaje_error '||mensaje_error);
+
+				end if;
+			else
+				mensaje_error := mensaje_error || 'El estudiante no tiene saldo a favor a devolver';
+				v_error := 'Y';
+				dbms_output.put_line('mensaje_error '||mensaje_error);
+
+			end if;
+
+		else
+            dbms_output.put_line('Registro no encontrado en tbracdt '||lv_acdt_validate);
+
+			lv_sum_value_tram := valor;
+            dbms_output.put_line('valor '||valor);
+
+            dbms_output.put_line('lv_sum_value_tram '||lv_sum_value_tram);
+            dbms_output.put_line('lv_sum_charge '||lv_sum_charge);
+            dbms_output.put_line('lv_sum_pay '||lv_sum_pay);
+
+			lv_sum_nc := lv_sum_charge - lv_sum_pay;
+            dbms_output.put_line('lv_sum_nc '||lv_sum_nc);
+			if lv_sum_nc < 0 then
+				lv_sum_nc := lv_sum_nc * -1;
+			end if;
+			if lv_sum_value_tram > lv_sum_nc then
+				mensaje_error := mensaje_error || 'El valor supera el monto de la nota crédito';
+				v_error := 'Y';
+				dbms_output.put_line('mensaje_error '||mensaje_error);
+
+			end if;
+		end if;
+        -------------------------------------------------------------------
+		tzRecord := null;
+        --------------------------------------------------------------
+		open searchCursor;
+		fetch searchCursor into tzRecord;
+		if searchCursor%notfound then
+			mensaje_error := mensaje_error || 'No existe registro conicidente para num_documento '|| doc_number || ' y ncre_sri '|| ncre_sri;
+			v_error := 'Y';
+		end if;
+		close searchCursor;
+        --------------------------------------------------------------
+		cod_detalle :=null;
+		getCodDevolucion(cod_detalle);
+		if cod_detalle = null then
+			mensaje_error := mensaje_error || 'Falta parametrizacion para "codigo de detalle';
+			v_error := 'Y';
+		end if;
+	end if;
+
+        if v_error = 'N' then
+		lastTranNumber := 1;
+		----------------------------------------
+		----------------------------------------
+        gb_common.p_set_context ('TB_RECEIVABLE',
+                                 'SYSTEM_TRAN',
+                                 'TRUE',
+                                 'N');
+        tb_receivable.p_create(
+					  pidm,
+					  tzRecord.tzrfact_term_code,
+					  cod_detalle,
+					  'SAP_IFI006',
+					  SYSDATE,
+					  valor,
+					  SYSDATE,--to_date(fecha_transac, 'DD/MM/YYYY'),
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  'T',
+					  'Y',
+					  0,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  to_date(fecha_transac, 'DD/MM/YYYY'),--ajuste ifi006 AC NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  'N',
+					  NULL ,
+					  NULL ,
+					  NULL ,
+					  lastTranNumber,
+					  p_row_id,
+					  NULL,
+					  NULL,
+					  NULL,
+					  NULL);
+					  commit;
+					  --aplicar pagos despues de afectar cuenta de estudiante.
+                      gb_common.p_set_context ('TB_RECEIVABLE',
+                          'PROCESS',
+                          'APPLPMNT',
+                          'N');
+					  begin
+						P_APLICATVRAPPL_IFI006 (p_id => gb_common.f_get_id(pidm),
+							 p_update_mode   => 'U',
+							 output          => lv_out_stat);
+					  end;
+					  --insertar en TSADETL
+					  begin
+						  p_insert_text  (
+						  p_pidm => pidm,
+						  p_tran_number => lastTranNumber,
+						  p_text => ncre_sri);
+						  commit;
+					 end;
+			----------------------------------------
+			response_obj.put('TIPO_MENSAJE', 'S');
+			response_obj.put('MENSAJE', 'Registro exitoso');
+			----------------------------------------
+        else
+            response_obj.put('TIPO_MENSAJE', 'E');
+            response_obj.put('MENSAJE', mensaje_error);
+        end if;
+        -------------------------------------------------------------------------------
+        response_obj.to_clob(largeresponse);
+        p_outputdata := largeresponse;
+        -------------------------------------------------------------------------------
+        ztz_async_proc.ps_setDataForPublishIfi(ifi006_iztid, json_entrada, p_outputdata, v_recid);
+        ifi_006_saveLog(v_recid, json_entrada, p_outputdata);
+        -------------------------------------------------------------------------------
+        EXCEPTION
+        WHEN OTHERS THEN
+            response_obj.put('TIPO_MENSAJE', 'E');
+            response_obj.put('MENSAJE', 'Error de registro: ' || SQLERRM);
+            response_obj.to_clob(largeresponse);
+            p_outputdata := largeresponse;
+            ---------------------------------------------------------------------------
+            ztz_async_proc.ps_setDataForPublishIfi(ifi006_iztid, json_entrada, p_outputdata, v_recid);
+			ifi_006_saveLog(v_recid, json_entrada, p_outputdata);
+
+            ---------------------------------------------------------------------------
+    END p_ifi006_registro;
